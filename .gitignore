@@ -1,0 +1,4 @@
+# Ignore Python cache and test files
+test/
+*.pyc
+__pycache__/

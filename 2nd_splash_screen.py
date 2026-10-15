@@ -21,15 +21,18 @@ with displayed dimensions at most 1280 x 720 (after EXIF orientation). Larger
 images are rejected. Accepted inputs are converted to 8-bit
 RGBA, then stored as BGRA bytes (4 bytes per pixel). Input file size is not
 limited by the raw pixel byte count: PNG/JPEG compression sizes differ.
+After --fit, width x height x 4 must not exceed the existing logo allocation.
+This capacity check runs before rebuilding the KIP or writing any output.
+An image that does not fit is rejected, including images with black borders;
+use a smaller image or rebuild boot from source for a larger allocation.
 
 No firmware rebuild, .inc file, or external executable is needed.
 The tool discovers the boot KIP through package3 metadata, decompresses its
 sections, and locates the logo through the ARM64 display-call arguments. It
-patches the compiled image dimensions, position, and pointer. A built-in BLZ
+patches the compiled image dimensions and position. A built-in BLZ
 encoder repacks modified sections and updates both offset tables and SHA-256
-metadata. Existing non-image variables retain their virtual addresses. Larger
-images can require materializing the original zero-initialized .bss inside
-.data, then appending pixels; the old .bss remains zero at its old addresses.
+metadata. The logo pointer, decoded section sizes/addresses and BSS layout
+are retained. Unused bytes in the existing logo allocation are zeroed.
 The resulting stored KIPs must still fit their shared 3 MiB area. Resolution
 alone does not guarantee that a detailed image will compress enough to fit.
 Other KIPs are verified unchanged. File size stays 8 MiB.
@@ -41,6 +44,10 @@ Tested against the supplied package3 (SHA-256):
 Other builds must use the same PK31/FSS0/KIP metadata layout and recognizable
 MOVZ x0..x3 / ADRP x4 / ADD x4 / BL display-call sequence. Unknown or ambiguous
 layouts are rejected. Binary validation is not a hardware boot test.
+
+Use an unmodified source package3. Earlier versions of this script emitted
+BLZ streams incompatible with Atmosphere's copy order; their generated files
+must not be used as replacement inputs.
 
 Format references:
 https://github.com/Atmosphere-NX/Atmosphere/blob/master/fusee/build_package3.py
@@ -110,11 +117,17 @@ def blz_decompress(src, expected_size):
                 token = struct.unpack_from('<H', data, cursor)[0]
                 count = min((token >> 12) + 3, output - lower)
                 distance = (token & 0xFFF) + 3
+                require(count <= distance,
+                        'Overlapping BLZ reference is unsupported. This may be output '
+                        'from an earlier faulty version of this script; use an '
+                        'unmodified package3.')
                 require(output - 1 + distance < len(data),
                         'BLZ back-reference is outside the output.')
-                for _ in range(count):
-                    output -= 1
-                    data[output] = data[output + distance]
+                # Match Atmosphere's BlzUncompress exactly: move the output
+                # cursor first, then copy the token's bytes in ascending order.
+                output -= count
+                for index in range(count):
+                    data[output + index] = data[output + distance + index]
             else:
                 require(cursor > lower, 'Truncated BLZ literal.')
                 cursor -= 1
@@ -150,8 +163,12 @@ def blz_compress(raw):
                     candidate = reverse.rfind(key, lower, end)
                     if candidate < 0:
                         break
+                    # Atmosphere copies each match in ascending address order.
+                    # A match must reference bytes already decoded before this
+                    # token, so its length cannot exceed its distance.
+                    candidate_limit = min(limit, position - candidate)
                     size = 3
-                    while size < limit and reverse[candidate + size] == reverse[position + size]:
+                    while size < candidate_limit and reverse[candidate + size] == reverse[position + size]:
                         size += 1
                     if size > match_length:
                         match_length, distance = size, position - candidate
@@ -471,6 +488,19 @@ def centered_position(width, height):
     return x, y
 
 
+def validate_logo_capacity(logo, width, height, pixels):
+    """Check the converted image against existing storage before any rebuild."""
+    validate_image_dimensions(width, height)
+    require(len(pixels) == width * height * IMAGE_BYTES_PER_PIXEL,
+            'Replacement pixel length mismatch.')
+    require(len(pixels) <= logo.size,
+            f'Input image after --fit is {width} x {height} '
+            f'({len(pixels):,} raw bytes); the existing logo allocation holds '
+            f'{logo.size:,} bytes. Replacement cancelled. Use a smaller image '
+            'or rebuild boot from source for a larger allocation. No output '
+            'was written.')
+
+
 def patch_display_arguments(boot, old_logo, new_logo):
     code = bytearray(boot.sections[0].decode())
     start = old_logo.call_address - boot.sections[0].address - 24
@@ -502,48 +532,19 @@ def patch_display_arguments(boot, old_logo, new_logo):
 
 
 def build_boot_with_image(boot, logo, width, height, pixels):
-    """Allocate pixels without relocating any existing non-image variable."""
+    """Replace the existing array without changing the process memory layout."""
+    validate_logo_capacity(logo, width, height, pixels)
     raw = [section.decode() for section in boot.sections]
     old_raw = list(raw)
-    rw_address = boot.sections[2].address
-    bss_address, bss_size = struct.unpack_from('<II', boot.blob, 0x50)
     require(logo.section_index in (1, 2), 'Unsupported logo storage section.')
     x, y = centered_position(width, height)
     section_index, offset = logo.section_index, logo.offset
-    is_data_tail = (section_index == 2 and bss_size == 0
-                    and offset + logo.size == len(raw[2]))
-    allocated_after_bss = False
-    if is_data_tail:
-        # A previous replacement's array is the final initialized object.
-        # Resize it in place; existing globals and their addresses are retained.
-        raw[2] = raw[2][:offset] + pixels
-        allocated_after_bss = True
-    elif len(pixels) <= logo.size:
-        raw[section_index] = (raw[section_index][:offset] + pixels
-                              + b'\0' * (logo.size - len(pixels))
-                              + raw[section_index][offset + logo.size:])
-    else:
-        # Preserve all existing .rodata/.data addresses. Make the existing BSS
-        # zeros explicit in .data, then place the new image beyond that region.
-        require(bss_size == 0 or bss_address >= rw_address + len(raw[2]),
-                'Overlapping writable data and BSS are unsupported.')
-        raw[section_index] = (raw[section_index][:offset] + b'\0' * logo.size
-                              + raw[section_index][offset + logo.size:])
-        address = align_up(max(rw_address + len(raw[2]), bss_address + bss_size), 4)
-        offset = address - rw_address
-        require(0 <= offset and offset + len(pixels) <= SECTION_DECODE_SIZE_LIMIT,
-                'Replacement exceeds the supported writable-section size.')
-        raw[2] += b'\0' * (offset - len(raw[2])) + pixels
-        section_index = 2
-        allocated_after_bss = True
+    raw[section_index] = (raw[section_index][:offset] + pixels
+                          + b'\0' * (logo.size - len(pixels))
+                          + raw[section_index][offset + logo.size:])
     new_logo = Logo(offset, width, height, x, y, logo.call_address, section_index)
     raw[0] = patch_display_arguments(boot, logo, new_logo)
     header = bytearray(boot.blob[:0x100])
-    if allocated_after_bss:
-        # The old BSS still exists, zero-filled, at its original virtual
-        # addresses inside the expanded writable segment. No old pointer moves.
-        struct.pack_into('<II', header, 0x50,
-                         align_up(rw_address + len(raw[2]), 0x1000), 0)
     stored_sections = []
     for index, section in enumerate(boot.sections):
         if raw[index] == old_raw[index]:
@@ -556,14 +557,15 @@ def build_boot_with_image(boot, logo, width, height, pixels):
             struct.pack_into('<II', header, 0x24 + index * 16,
                              len(raw[index]), len(stored))
         stored_sections.append(stored)
+    require(all(header[start:start + 8] == boot.blob[start:start + 8]
+                for start in (0x20, 0x30, 0x40, 0x50)),
+            'Verification failed: decoded segment geometry or BSS changed.')
     validate_boot_memory_layout(header)
     return bytes(header) + b''.join(stored_sections), new_logo, raw
 
 
 def replace_logo(data, kips, boot, logo, width, height, pixels):
-    validate_image_dimensions(width, height)
-    require(len(pixels) == width * height * IMAGE_BYTES_PER_PIXEL,
-            'Replacement pixel length mismatch.')
+    validate_logo_capacity(logo, width, height, pixels)
     old_pixels = boot.sections[logo.section_index].decode()[logo.offset:logo.offset + logo.size]
     if width == logo.width and height == logo.height and old_pixels == pixels:
         return data  # A pixel-identical round trip preserves the entire binary.
@@ -686,6 +688,9 @@ def main(argv=None):
                 atomic_write(target, lambda path: image.save(path, format='PNG'), args.force)
             case 'replace':
                 width, height, pixels = replacement_pixels(args.image, args.fit)
+                print(f'Capacity check: input {width} x {height} = {len(pixels):,} '
+                      f'raw bytes; existing logo allocation = {logo.size:,} bytes.')
+                validate_logo_capacity(logo, width, height, pixels)
                 x, y = centered_position(width, height)
                 print(f'Replacement after --fit {args.fit}: {width} x {height}, '
                       f'{len(pixels):,} raw bytes; '

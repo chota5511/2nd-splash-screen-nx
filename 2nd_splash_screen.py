@@ -6,6 +6,7 @@ Extract:  python 2nd_splash_screen.py extract package3 -o sept_logo.png
 Replace:  python 2nd_splash_screen.py replace package3 my_logo.png -o package3_custom
 Fit:      python 2nd_splash_screen.py replace package3 my_logo.png --fit h_scale -o package3_custom
 Info:     python 2nd_splash_screen.py info package3
+Verify:   python 2nd_splash_screen.py verify package3
 
 The original input is never overwritten. Existing outputs require --force.
 --fit original keeps the provided dimensions.
@@ -248,6 +249,7 @@ def read_package(data):
         entry = start + i * 32
         offset, size = struct.unpack_from('<II', data, entry)
         kind = data[entry + 8]
+        require(offset + size <= len(data), 'FSS0 content extends beyond package3.')
         if kind not in (6, 8):
             require(offset + size <= KIP_START or offset >= KIP_END,
                     'Unexpected non-KIP content in the KIP area.')
@@ -292,6 +294,7 @@ def read_package(data):
             'Unknown data after KIPs; refusing to overwrite it.')
     boots = [kip for kip in kips if kip.program_id == BOOT_ID and kip.name == 'boot']
     require(len(boots) == 1, 'Expected exactly one Atmosphere boot KIP.')
+    validate_boot_memory_layout(boots[0].blob)
     return kips, boots[0]
 
 
@@ -345,6 +348,29 @@ def locate_logo(boot):
             f'Found {len(candidates)} possible logo display calls; expected one. '
             'This compiler/build layout is unsupported; no output was written.')
     return candidates[0]
+
+
+def verify_package(data, kips, boot, logo):
+    """Validate every stored section without changing the firmware."""
+    sections = 0
+    for kip in kips:
+        for section in kip.sections:
+            section.decode()
+            sections += 1
+    pixels = boot.sections[logo.section_index].decode()
+    require(len(pixels[logo.offset:logo.offset + logo.size]) == logo.size,
+            'Logo pixel data is truncated.')
+    print(f'SHA-256: {hashlib.sha256(data).hexdigest()}')
+    print(f'Verified: package structure, {len(kips)} KIP hashes, '
+          f'{sections} decoded sections, boot memory layout, and logo pixel bounds.')
+    # Report compatibility with existing builds independently of file integrity.
+    first_row = IMAGE_MAX_WIDTH - logo.x
+    last_row = IMAGE_MAX_WIDTH - (logo.x + logo.width - 1)
+    if not (0 <= last_row <= first_row < IMAGE_MAX_WIDTH
+            and 0 <= logo.y and logo.y + logo.height <= IMAGE_MAX_HEIGHT):
+        print('Warning: existing logo position exceeds the native framebuffer '
+              'bounds assumed by this tool; hardware behavior requires validation.')
+    print('Firmware was not modified. Hardware boot behavior is not tested.')
 
 
 def image_library():
@@ -621,6 +647,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest='command', required=True)
     info = commands.add_parser('info', help='Locate the small boot logo.')
     info.add_argument('package3', type=Path)
+    verify = commands.add_parser('verify', help='Verify package and all KIP sections without writing.')
+    verify.add_argument('package3', type=Path)
     extract = commands.add_parser('extract', help='Extract the small boot logo as PNG.')
     extract.add_argument('package3', type=Path)
     extract.add_argument('-o', '--output', type=Path, default=Path('sept_logo.png'))
@@ -643,6 +671,9 @@ def main(argv=None):
         section_name = '.rodata' if logo.section_index == 1 else '.data'
         print(f'Pixels: decompressed {section_name} + 0x{logo.offset:X}, {logo.size:,} bytes')
         if args.command == 'info':
+            return 0
+        if args.command == 'verify':
+            verify_package(data, kips, boot, logo)
             return 0
         inputs = [args.package3] + ([args.image] if args.command == 'replace' else [])
         target = output_path(args.output, inputs, args.force)

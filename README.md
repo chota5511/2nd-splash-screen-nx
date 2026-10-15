@@ -11,6 +11,19 @@ This tool is provided as-is without any warranty. Use at your own risk.
 - Extract:  `python 2nd_splash_screen.py extract package3 -o sept_logo.png`
 - Replace:  `python 2nd_splash_screen.py replace package3 my_logo.png -o package3_custom`
 - Info:     `python 2nd_splash_screen.py info package3`
+- Verify:   `python 2nd_splash_screen.py verify package3`
+
+`verify` checks package structure, every KIP SHA-256 and stored section,
+boot memory layout, and logo pixel bounds without writing files. A successful
+check exits with status 0; invalid input exits with status 1. Existing logo
+positions outside the native framebuffer bounds produce a warning, independently
+of structural validity. Verification does not test hardware boot behavior.
+
+For the supplied firmware files:
+```
+python 2nd_splash_screen.py verify package3.original.bk
+python 2nd_splash_screen.py verify package3.kefir.bk
+```
 
 ### Flags
 *-o, --output*: Specify the output file.

@@ -51,7 +51,7 @@ $ python 2nd_splash_screen.py replace package3 my_logo.png -o package3_custom --
 ```
 
 ## Behaviors
-After fitting, dimensions are proportionally reduced as needed to stay inside
+fter fitting, dimensions are proportionally reduced as needed to stay inside
 1280 x 720. Integer pixel dimensions may slightly
 round aspect ratios. Images are never cropped and are always auto-centered.
 Transparent pixels are composited on black. Inputs must be static, single-frame images
@@ -59,15 +59,19 @@ with displayed dimensions at most 1280 x 720 (after EXIF orientation). Larger
 images are rejected. Accepted inputs are converted to 8-bit
 RGBA, then stored as BGRA bytes (4 bytes per pixel). Input file size is not
 limited by the raw pixel byte count: PNG/JPEG compression sizes differ.
+After --fit, width x height x 4 must not exceed the existing logo allocation.
+This capacity check runs before rebuilding the KIP or writing any output.
+An image that does not fit is rejected, including images with black borders;
+use a smaller image or rebuild boot from source for a larger allocation.
 
 No firmware rebuild, .inc file, or external executable is needed.
 The tool discovers the boot KIP through package3 metadata, decompresses its
 sections, and locates the logo through the ARM64 display-call arguments. It
-patches the compiled image dimensions, position, and pointer. A built-in BLZ
+patches the compiled image dimensions and position. A built-in BLZ
 encoder repacks modified sections and updates both offset tables and SHA-256
-metadata. Existing non-image variables retain their virtual addresses. Larger
-images can require materializing the original zero-initialized .bss inside
-.data, then appending pixels; the old .bss remains zero at its old addresses.
+metadata. The logo pointer, decoded section sizes/addresses and BSS layout
+are retained. Unused bytes in the existing logo allocation are zeroed.
+
 The resulting stored KIPs must still fit their shared 3 MiB area. Resolution
 alone does not guarantee that a detailed image will compress enough to fit.
 Other KIPs are verified unchanged. File size stays 8 MiB.
@@ -80,6 +84,10 @@ Tested against the supplied package3 (SHA-256):
 Other builds must use the same PK31/FSS0/KIP metadata layout and recognizable
 MOVZ x0..x3 / ADRP x4 / ADD x4 / BL display-call sequence. Unknown or ambiguous
 layouts are rejected. Binary validation is not a hardware boot test.
+
+Use an unmodified source package3. Earlier versions of this script emitted
+BLZ streams incompatible with Atmosphere's copy order; their generated files
+must not be used as replacement inputs.
 
 ## Format references:
 - `https://github.com/Atmosphere-NX/Atmosphere/blob/master/fusee/build_package3.py`
